@@ -13,10 +13,11 @@ class MitigationEngine:
         self.alerts_path = alerts_path
         self.webhook_path = webhook_path
         os.makedirs(os.path.dirname(alerts_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(webhook_path) or ".", exist_ok=True)
 
-    def process(self, assessment: Any) -> Alert:
+    def process(self, assessment: Any, container_id: str = "unknown") -> Alert:
         alert = Alert(
-            container_id="unknown",
+            container_id=container_id,
             classification=getattr(assessment, "classification", "Unknown"),
             risk_score=float(getattr(assessment, "normalized_score", 0.0)),
             action_taken="review_container" if getattr(assessment, "classification", "Unknown") in {"High", "Critical"} else "monitor",
@@ -24,15 +25,26 @@ class MitigationEngine:
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         try:
-            with open(self.alerts_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps({
-                    "container_id": alert.container_id,
-                    "classification": alert.classification,
-                    "risk_score": alert.risk_score,
-                    "action_taken": alert.action_taken,
-                    "factors": alert.factors,
-                    "timestamp": alert.timestamp,
-                }) + "\n")
+            existing = []
+            if os.path.exists(self.alerts_path) and os.path.getsize(self.alerts_path) > 0:
+                with open(self.alerts_path, "r", encoding="utf-8") as handle:
+                    try:
+                        loaded = json.load(handle)
+                    except json.JSONDecodeError:
+                        loaded = []
+                    existing = loaded if isinstance(loaded, list) else []
+
+            existing.append({
+                "container_id": alert.container_id,
+                "classification": alert.classification,
+                "risk_score": alert.risk_score,
+                "action_taken": alert.action_taken,
+                "factors": alert.factors,
+                "timestamp": alert.timestamp,
+            })
+
+            with open(self.alerts_path, "w", encoding="utf-8") as handle:
+                json.dump(existing, handle, indent=2)
         except OSError:
             pass
         return alert

@@ -20,8 +20,23 @@ refresh = st.sidebar.number_input("Refresh interval (seconds)", 1, 30, 3)
 def load(path):
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+            text = f.read().strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return payload if isinstance(payload, list) else [payload]
+    except OSError:
         return []
 
 placeholder = st.empty()

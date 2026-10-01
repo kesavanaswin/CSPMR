@@ -12,6 +12,7 @@ runtime telemetry arrives.
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import signal
 import threading
@@ -30,6 +31,7 @@ from utils.logger import get_logger
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POLICY_PATH = os.path.join(BASE_DIR, "config", "policies.yaml")
+REPORT_PATH = os.path.join(BASE_DIR, "output", "risk_report.json")
 ALERTS = os.path.join(BASE_DIR, "output", "alerts.json")
 WEBHOOKS = os.path.join(BASE_DIR, "output", "webhook_notifications.json")
 
@@ -49,13 +51,37 @@ class RealtimeCSPM:
         self.containers: Dict[str, ContainerConfig] = {}
         self.vulns = {}
         self.events: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        self.latest_assessments: Dict[str, dict] = {}
         self._stop = threading.Event()
         self._seen_alert_state = {}
+        self.report_path = REPORT_PATH
+        self.write_report()
+
+    def write_report(self):
+        os.makedirs(os.path.dirname(self.report_path) or ".", exist_ok=True)
+        payload = []
+        for cid, container in sorted(self.containers.items()):
+            assessment = self.latest_assessments.get(cid, {})
+            payload.append({
+                "container": {
+                    "container_id": cid,
+                    "image": getattr(container, "image", ""),
+                    "namespace": getattr(container, "namespace", "default"),
+                    "environment": getattr(container, "environment", "production"),
+                },
+                "risk_assessment": assessment,
+            })
+        with open(self.report_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
 
     def stop(self, *_):
         self._stop.set()
 
     def discover(self):
+        if not self.docker.available():
+            log.warning("Docker CLI is not available on PATH; skipping live container discovery.")
+            self.write_report()
+            return
         for item in self.docker.list_containers():
             cid = item.get("ID")
             if not cid:
@@ -98,6 +124,15 @@ class RealtimeCSPM:
         )
 
         state = (assessment.classification, round(assessment.normalized_score, 2))
+        self.latest_assessments[cid] = {
+            "classification": assessment.classification,
+            "normalized_score": round(assessment.normalized_score, 2),
+            "vulnerability_score": round(assessment.vulnerability_score, 2),
+            "privilege_score": round(assessment.privilege_score, 2),
+            "exposure_score": round(assessment.exposure_score, 2),
+            "anomaly_score": round(assessment.anomaly_score, 2),
+        }
+        self.write_report()
         print(
             f"[CSPM] {cid[:12]:<12} "
             f"risk={assessment.normalized_score:6.2f} "
@@ -109,7 +144,7 @@ class RealtimeCSPM:
 
         # Avoid generating identical alerts for every repeated runtime event.
         if self._seen_alert_state.get(cid) != state:
-            alert = self.mitigation.process(assessment)
+            alert = self.mitigation.process(assessment, container_id=cid)
             self._seen_alert_state[cid] = state
             if assessment.classification in {"High", "Critical"}:
                 try:
@@ -121,7 +156,8 @@ class RealtimeCSPM:
 
     def docker_loop(self):
         if not self.docker.available():
-            raise RuntimeError("Docker CLI is not available on PATH")
+            log.warning("Docker CLI is not available on PATH; Docker event collection is disabled.")
+            return
         for event in self.docker.stream():
             if self._stop.is_set():
                 return
@@ -141,41 +177,57 @@ class RealtimeCSPM:
                     self.containers.pop(key, None)
                     self.vulns.pop(key, None)
                     self.events.pop(key, None)
+                    self.latest_assessments.pop(key, None)
+                    self.write_report()
 
     def falco_loop(self):
-        for event in self.falco.stream():
-            if self._stop.is_set():
-                return
-            cid = event.container_id
-            # Falco may emit a container name rather than ID. Resolve by exact
-            # container id first, then by a short/name suffix where possible.
-            resolved = cid
-            if cid not in self.containers:
-                matches = [k for k in self.containers if k.startswith(cid)]
-                if matches:
-                    resolved = matches[0]
-            event.container_id = resolved
-            self.events[resolved].append(event)
-            print(
-                f"[FALCO] {resolved[:12]:<12} "
-                f"{event.event_type} suspicious={event.suspicious}"
-            )
-            self.evaluate(resolved)
+        try:
+            for event in self.falco.stream():
+                if self._stop.is_set():
+                    return
+                cid = event.container_id
+                # Falco may emit a container name rather than ID. Resolve by exact
+                # container id first, then by a short/name suffix where possible.
+                resolved = cid
+                if cid not in self.containers:
+                    matches = [k for k in self.containers if k.startswith(cid)]
+                    if matches:
+                        resolved = matches[0]
+                event.container_id = resolved
+                self.events[resolved].append(event)
+                print(
+                    f"[FALCO] {resolved[:12]:<12} "
+                    f"{event.event_type} suspicious={event.suspicious}"
+                )
+                self.evaluate(resolved)
+        except FileNotFoundError:
+            log.warning("Falco output file not found at %s; waiting for telemetry before continuing.", self.falco.path)
+            while not self._stop.wait(2):
+                if os.path.exists(self.falco.path):
+                    break
 
     def run(self):
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
         self.discover()
 
-        threads = [
-            threading.Thread(target=self.docker_loop, name="docker-events", daemon=True),
-            threading.Thread(target=self.falco_loop, name="falco-events", daemon=True),
-        ]
+        threads = []
+        if self.docker.available():
+            threads.append(threading.Thread(target=self.docker_loop, name="docker-events", daemon=True))
+        else:
+            print(f"[CSPM] Docker CLI not found on PATH. Docker collection is disabled.")
+
+        threads.append(threading.Thread(target=self.falco_loop, name="falco-events", daemon=True))
+
         for t in threads:
             t.start()
 
-        print("[CSPM] Real-time monitoring is active. Press Ctrl+C to stop.")
-        print("[CSPM] Sources: Docker events + Trivy + Falco")
+        if self.docker.available():
+            print("[CSPM] Real-time monitoring is active. Press Ctrl+C to stop.")
+            print("[CSPM] Sources: Docker events + Trivy + Falco")
+        else:
+            print("[CSPM] No live sources are available. The app is running in a degraded mode.")
+            print(f"[CSPM] Falco backlog path: {self.falco.path}")
         while not self._stop.wait(1):
             pass
         print("[CSPM] Stopping...")
