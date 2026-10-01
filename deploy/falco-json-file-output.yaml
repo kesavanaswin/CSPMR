@@ -1,0 +1,10 @@
+# Reference Falco configuration fragment.
+# Add/merge this with the Falco configuration used by your installation.
+# The exact ConfigMap/Helm values depend on the Falco deployment method.
+customRules: {}
+falco:
+  json_output: true
+  json_include_output_property: true
+  file_output:
+    enabled: true
+    filename: /var/log/falco/falco.json

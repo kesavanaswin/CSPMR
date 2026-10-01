@@ -1,0 +1,21 @@
+environment_multipliers:
+  development: 0.8
+  staging: 1.0
+  production: 1.3
+
+checks:
+  privileged:
+    enabled: true
+    severity: high
+  host_network:
+    enabled: true
+    severity: medium
+  host_pid:
+    enabled: true
+    severity: medium
+  run_as_root:
+    enabled: true
+    severity: medium
+  exposed_publicly:
+    enabled: true
+    severity: medium
